@@ -10,6 +10,7 @@ use App\Models\OrderItem;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
 
 class ChatbotController extends Controller
 {
@@ -24,15 +25,16 @@ class ChatbotController extends Controller
         // 1. Build System Instruction with strict role boundaries & dynamic database context
         $systemInstruction = $this->buildSystemInstruction($role);
 
-        // 2. Call Groq API
-        $apiKey = env('GROQ_API_KEY');
+        // 2. Fetch OpenRouter API Key
+        $apiKey = env('OPENROUTER_API_KEY');
         if (empty($apiKey)) {
             return response()->json([
-                'reply' => 'The AI assistant service is missing an API configuration key.'
+                'reply' => 'The AI assistant service is missing an API key.'
             ], 500);
         }
 
-        $aiReply = $this->callGroqApi($apiKey, $systemInstruction, $userPrompt);
+        // 3. Call OpenRouter API
+        $aiReply = $this->callOpenRouterApi($apiKey, $systemInstruction, $userPrompt);
 
         if ($aiReply !== null) {
             return response()->json(['reply' => $aiReply]);
@@ -44,33 +46,31 @@ class ChatbotController extends Controller
     }
 
     /**
-     * Sends user prompt & database context directly to Groq API (Llama 3.3 70B)
+     * Sends user prompt & database context to OpenRouter API
      */
-    private function callGroqApi(string $apiKey, string $systemInstruction, string $userPrompt): ?string
+    private function callOpenRouterApi(string $apiKey, string $systemInstruction, string $userPrompt): ?string
     {
-        $models = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'];
+        // Free-tier model slugs on OpenRouter
+        $models = [
+            'nvidia/nemotron-3.5-lightning:freee'
+        ];
 
         foreach ($models as $model) {
             try {
-                $response = Http::timeout(10)
+                $response = Http::withoutVerifying() // Bypasses local cURL SSL check
+                    ->timeout(12)
                     ->withHeaders([
                         'Authorization' => 'Bearer ' . $apiKey,
                         'Content-Type' => 'application/json',
                     ])
-                    ->post('https://api.groq.com/openai/v1/chat/completions', [
+                    ->post('https://openrouter.ai/api/v1/chat/completions', [
                         'model' => $model,
                         'messages' => [
-                            [
-                                'role' => 'system',
-                                'content' => $systemInstruction,
-                            ],
-                            [
-                                'role' => 'user',
-                                'content' => $userPrompt,
-                            ],
+                            ['role' => 'system', 'content' => $systemInstruction],
+                            ['role' => 'user', 'content' => $userPrompt],
                         ],
                         'temperature' => 0.3,
-                        'max_tokens' => 800,
+                        'max_tokens' => 600,
                     ]);
 
                 if ($response->successful()) {
@@ -79,21 +79,19 @@ class ChatbotController extends Controller
                     if ($reply) {
                         return trim($reply);
                     }
+                } else {
+                    Log::error("OpenRouter API Error [Model: {$model}]: " . $response->status() . " - " . $response->body());
                 }
             } catch (\Exception $e) {
-                // Try fallback model
+                Log::error("OpenRouter API Exception [Model: {$model}]: " . $e->getMessage());
             }
         }
 
         return null;
     }
 
-    /**
-     * Constructs Generative AI Prompt with live context and strict role-based restrictions
-     */
     private function buildSystemInstruction(string $role): string
     {
-        // Compute live top sellers data
         $topSelling = OrderItem::select('product_id', DB::raw('SUM(quantity) as total_qty'), DB::raw('SUM(price * quantity) as total_sales'))
             ->groupBy('product_id')
             ->orderByDesc('total_qty')
@@ -101,7 +99,6 @@ class ChatbotController extends Controller
             ->get();
 
         if ($role === 'admin') {
-            // ADMIN DATA CONTEXT
             $totalSales = OrderItem::sum(DB::raw('price * quantity')) ?: 0;
             $orderCount = Order::count();
             $customerCount = User::where('role', 'user')->count();
@@ -162,7 +159,7 @@ LIVE STORE DATABASE CONTEXT (ADMIN LEVEL):
 {$dbContextJson}";
         }
 
-        // PUBLIC USER DATA CONTEXT
+        // PUBLIC CUSTOMER CONTEXT
         $categories = Category::withCount('products')->get()->map(function ($c) {
             return [
                 'category_name' => $c->name,
